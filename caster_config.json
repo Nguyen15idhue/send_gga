@@ -1,0 +1,32 @@
+{
+  "base_connection": {
+    "name": "My Upstream Base",
+    "host": "203.171.25.138",
+    "port": 1509,
+    "mountpoint": "CanTho",
+    "username": "admin2",
+    "password": "123456",
+    "gga_interval": 10,
+    "location": {
+      "name": "Cần Thơ",
+      "lat": 10.1046,
+      "lon": 105.6014
+    }
+  },
+  "caster_settings": {
+    "host": "0.0.0.0",
+    "port": 2102,
+    "mountpoint": "MYCASTER",
+    "sourcetable": "STR;MYCASTER;My Local Caster;RTCM 3.2;1005(10),1077(1),1087(1),1097(1),1127(1);2;GPS+GLO+GAL+BDS;SNIP;VN;21.03;105.85;1;0;sNTRIP;N;N;0"
+  },
+  "rover_accounts": [
+    {
+      "username": "rover1",
+      "password": "password123"
+    },
+    {
+      "username": "rover2",
+      "password": "password456"
+    }
+  ]
+}
