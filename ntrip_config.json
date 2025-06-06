@@ -1,0 +1,12 @@
+{
+    "connections": [
+        {
+            "name": "testhn",
+            "host": "203.171.25.138",
+            "port": 1509,
+            "mountpoint": "HaNoi",
+            "username": "admin2",
+            "password": "123456"
+        }
+    ]
+}
