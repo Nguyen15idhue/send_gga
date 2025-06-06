@@ -10,8 +10,7 @@ from datetime import datetime
 CONFIG_FILE = "caster_config.json"
 
 # ==============================================================================
-# Lớp Worker: Kết nối đến Base nguồn và lấy dữ liệu RTCM
-# (Không thay đổi so với phiên bản trước)
+# Lớp NtripClientWorker (Không thay đổi)
 # ==============================================================================
 class NtripClientWorker(threading.Thread):
     def __init__(self, config, data_queue):
@@ -75,7 +74,6 @@ class NtripClientWorker(threading.Thread):
                     continue
 
                 print(f"[+] {self.name}: Kết nối Base thành công. Bắt đầu nhận dữ liệu.")
-                # Một số Caster yêu cầu GGA sau khi phản hồi OK
                 if self.config.get('gga_interval', 0) > 0:
                     s.sendall(self._generate_gga())
                     last_gga_time = time.time()
@@ -87,13 +85,10 @@ class NtripClientWorker(threading.Thread):
                     if not data:
                         print(f"[!] {self.name}: Mất kết nối đến Base. Sẽ kết nối lại...")
                         break
-                    
                     self.data_queue.put(data)
-                    
                     if self.config.get('gga_interval', 0) > 0 and (time.time() - last_gga_time >= self.config['gga_interval']):
                         s.sendall(self._generate_gga())
                         last_gga_time = time.time()
-                        
             except (socket.error, socket.timeout) as e:
                 print(f"[!] {self.name}: Lỗi socket ({e}). Đang thử kết nối lại sau 5 giây...")
             except Exception as e:
@@ -109,67 +104,118 @@ class NtripClientWorker(threading.Thread):
         self.stop_event.set()
 
 # ==============================================================================
-# Lớp Handler: Xử lý từng kết nối từ Rover (***ĐÃ CẬP NHẬT***)
+# Lớp BaseStationHandler (Không thay đổi)
 # ==============================================================================
-class RoverHandler(threading.Thread):
-    def __init__(self, client_socket, address, caster_config, rover_accounts, data_queue):
+class BaseStationHandler(threading.Thread):
+    def __init__(self, client_socket, address, config, data_queue, on_disconnect_callback):
         super().__init__()
         self.client_socket = client_socket
         self.address = address
-        self.caster_config = caster_config
-        self.rover_accounts = rover_accounts
+        self.config = config
+        self.data_queue = data_queue
+        self.stop_event = threading.Event()
+        self.on_disconnect_callback = on_disconnect_callback
+        self.name = f"BaseHandler-{address[0]}:{address[1]}"
+        self.daemon = True
+
+    def run(self):
+        print(f"[+] Base Station kết nối từ {self.address}. Đang xác thực...")
+        try:
+            self.client_socket.settimeout(10)
+            request_data = self.client_socket.recv(2048).decode(errors='ignore')
+
+            if not request_data.startswith("SOURCE"):
+                print(f"[-] Base {self.address}: Yêu cầu không hợp lệ. Chỉ chấp nhận 'SOURCE'.")
+                self.client_socket.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\nERROR - Use SOURCE method\r\n")
+                return
+
+            parts = request_data.split()
+            if len(parts) < 2:
+                print(f"[-] Base {self.address}: Yêu cầu SOURCE không đầy đủ.")
+                self.client_socket.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\nERROR - Malformed SOURCE request\r\n")
+                return
+
+            source_password = parts[1]
+            expected_password = self.config.get("base_source_password")
+
+            if source_password != expected_password:
+                print(f"[-] Base {self.address}: Sai mật khẩu nguồn.")
+                self.client_socket.sendall(b"HTTP/1.1 401 Unauthorized\r\n\r\nERROR - Bad Password\r\n")
+                return
+            
+            print(f"[+] Base {self.address} xác thực thành công. Bắt đầu nhận dữ liệu RTCM.")
+            self.client_socket.sendall(b"ICY 200 OK\r\n\r\n")
+            
+            while not self.data_queue.empty():
+                self.data_queue.get()
+
+            self.client_socket.settimeout(30)
+            
+            while not self.stop_event.is_set():
+                data = self.client_socket.recv(4096)
+                if not data:
+                    print(f"[-] Base {self.address} đã ngắt kết nối.")
+                    break
+                self.data_queue.put(data)
+
+        except (socket.timeout, IndexError, ValueError):
+            print(f"[-] Yêu cầu từ Base {self.address} không hợp lệ hoặc timeout.")
+        except Exception as e:
+            print(f"[!] Lỗi không xác định trong {self.name}: {e}")
+        finally:
+            self.client_socket.close()
+            self.on_disconnect_callback()
+            print(f"[-] Đã đóng kết nối với Base Station {self.address}.")
+
+    def stop(self):
+        self.stop_event.set()
+
+# ==============================================================================
+# Lớp RoverHandler (Cập nhật)
+# ==============================================================================
+class RoverHandler(threading.Thread):
+    # <<< THAY ĐỔI: Constructor giờ nhận global_rover_accounts thay vì station_config
+    def __init__(self, client_socket, address, caster_settings, global_rover_accounts, data_queue):
+        super().__init__()
+        self.client_socket = client_socket
+        self.address = address
+        self.caster_settings = caster_settings
+        self.rover_accounts = global_rover_accounts # <<< THAY ĐỔI: Sử dụng danh sách tài khoản toàn cục
         self.data_queue = data_queue
         self.stop_event = threading.Event()
         self.name = f"RoverHandler-{address[0]}:{address[1]}"
         self.daemon = True
 
+    # Phương thức _is_authenticated không cần thay đổi, vì nó đã dùng self.rover_accounts
     def _is_authenticated(self, auth_header, mountpoint):
-        """Kiểm tra mountpoint và xác thực người dùng. Trả về (bool, str)"""
-        # 1. Kiểm tra Mountpoint
-        if mountpoint != f"/{self.caster_config['mountpoint']}":
+        if mountpoint != f"/{self.caster_settings['mountpoint']}":
             return False, "Bad Mountpoint"
         
-        # 2. Kiểm tra header xác thực
         if not auth_header:
             return False, "Authorization header is missing"
 
         try:
-            # Tách header, ví dụ: "Authorization: Basic cm92ZXIxOnBhc3N3b3JkMTIz"
-            auth_type, auth_token = auth_header.replace("Authorization: ", "").split()
+            auth_type, auth_token = auth_header.replace("Authorization: ", "").strip().split()
             if auth_type.lower() != 'basic':
                 return False, f"Unsupported Auth type: {auth_type}"
             
-            # Giải mã base64
             decoded_creds = base64.b64decode(auth_token).decode()
             username, password = decoded_creds.split(':', 1)
 
-            # Kiểm tra với danh sách tài khoản
             for acc in self.rover_accounts:
                 if acc['username'] == username and acc['password'] == password:
                     return True, f"Authenticated as {username}"
             
-            # Nếu không tìm thấy user/pass phù hợp
             return False, f"Invalid credentials for user '{username}'"
-
-        except (ValueError, IndexError) as e:
-            # Lỗi nếu header bị dị dạng (không có space, không có dấu ':')
+        except Exception as e:
             print(f"[!] Lỗi phân tích Auth Header: {e}")
             return False, "Malformed Authorization header"
-        except Exception as e:
-            # Các lỗi không mong muốn khác
-            print(f"[!] Lỗi xác thực không mong muốn: {e}")
-            return False, "Bad Auth Header (unexpected error)"
 
     def run(self):
         print(f"[+] Rover mới kết nối từ: {self.address}")
         try:
             self.client_socket.settimeout(10)
             request_data = self.client_socket.recv(2048).decode(errors='ignore')
-            
-            # === DEBUG: In ra yêu cầu gốc từ client ===
-            print(f"--- [DEBUG] Raw request from {self.address} ---")
-            print(request_data)
-            print("------------------------------------------")
             
             if not request_data:
                 print(f"[-] Không nhận được dữ liệu từ {self.address}. Đóng kết nối.")
@@ -179,14 +225,11 @@ class RoverHandler(threading.Thread):
             request_line = headers[0]
             method, mountpoint, _ = request_line.split()
 
-            # Tìm header Authorization (không phân biệt chữ hoa, chữ thường)
             auth_header = next((h for h in headers if h.lower().startswith('authorization:')), None)
-
             is_auth, reason = self._is_authenticated(auth_header, mountpoint)
 
             if not is_auth:
                 print(f"[-] Rover {self.address} xác thực thất bại: {reason}")
-                # Gửi phản hồi lỗi phù hợp
                 if reason == "Bad Mountpoint":
                     self.client_socket.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
                 else:
@@ -198,14 +241,11 @@ class RoverHandler(threading.Thread):
             
             self.client_socket.settimeout(None)
             
-            # Lấy dữ liệu từ queue và gửi cho Rover
             while not self.stop_event.is_set():
                 try:
                     rtcm_data = self.data_queue.get(timeout=15)
                     self.client_socket.sendall(rtcm_data)
                 except Empty:
-                    # Không có dữ liệu mới từ Base trong 15s
-                    # Có thể là kết nối Base đã chết, vòng lặp sẽ tiếp tục chờ
                     continue
                 except socket.error:
                     print(f"[-] Rover {self.address} đã ngắt kết nối.")
@@ -218,21 +258,19 @@ class RoverHandler(threading.Thread):
             self.client_socket.close()
             print(f"[-] Đã đóng kết nối với Rover {self.address}.")
 
-
 # ==============================================================================
-# Lớp Caster Server chính và Hàm main
-# (Không thay đổi so với phiên bản trước)
+# Lớp Caster Server chính (Cập nhật)
 # ==============================================================================
 class NtripCasterServer:
-    def __init__(self, config):
-        self.config = config
-        self.caster_settings = config['caster_settings']
-        self.base_connection_config = config['base_connection']
-        self.rover_accounts = config['rover_accounts']
+    # <<< THAY ĐỔI: Constructor nhận thêm global_rover_accounts
+    def __init__(self, station_config, global_rover_accounts):
+        self.config = station_config
+        self.caster_settings = station_config['caster_settings']
+        self.global_rover_accounts = global_rover_accounts # <<< THAY ĐỔI: Lưu trữ tài khoản toàn cục
         self.rtcm_data_queue = Queue(maxsize=100)
-        self.client_worker = None
         self.server_socket = None
         self.rover_handlers = []
+        self.data_source_worker = None
         self.stop_event = threading.Event()
 
     def _handle_sourcetable_request(self, client_socket):
@@ -249,13 +287,24 @@ class NtripCasterServer:
         client_socket.sendall(response.encode())
         client_socket.close()
 
-    def start(self):
-        print("=============================================")
-        print("=== BẮT ĐẦU CHẠY NTRIP CASTER TRUNG GIAN ===")
-        print("=============================================")
+    def _on_base_disconnect(self):
+        print("[!] Kết nối từ Base Station đã mất. Caster đang chờ kết nối Base mới.")
+        self.data_source_worker = None
 
-        self.client_worker = NtripClientWorker(self.base_connection_config, self.rtcm_data_queue)
-        self.client_worker.start()
+    def start(self):
+        print("="*45)
+        print(f"=== KHỞI ĐỘNG TRẠM: {self.config['name']} ===")
+        print(f"=== MODE: {self.config['mode']} ===")
+        print("="*45)
+
+        if self.config['mode'] == 'NtripClient':
+            self.data_source_worker = NtripClientWorker(self.config['base_connection'], self.rtcm_data_queue)
+            self.data_source_worker.start()
+        elif self.config['mode'] == 'NtripCaster':
+            print("[*] Chế độ NtripCaster: Đang chờ Base Station kết nối và đẩy dữ liệu...")
+        else:
+            print(f"[!] Lỗi: Mode '{self.config['mode']}' không được hỗ trợ.")
+            return
 
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -263,8 +312,8 @@ class NtripCasterServer:
             host = self.caster_settings['host']
             port = self.caster_settings['port']
             self.server_socket.bind((host, port))
-            self.server_socket.listen(5)
-            print(f"[+] Caster đang lắng nghe trên {host}:{port}")
+            self.server_socket.listen(10)
+            print(f"[+] Caster đang lắng nghe trên {host}:{port} cho các kết nối từ Rover (và Base nếu ở mode NtripCaster)")
         except OSError as e:
             print(f"[!] LỖI NGHIÊM TRỌNG: Không thể bind tới {host}:{port}. Lỗi: {e}")
             self.stop()
@@ -276,11 +325,30 @@ class NtripCasterServer:
                 client_socket, address = self.server_socket.accept()
                 
                 first_bytes = client_socket.recv(1024, socket.MSG_PEEK)
-                if first_bytes.startswith(b'GET / '):
+                request_str = first_bytes.decode(errors='ignore')
+
+                if request_str.startswith('GET / '):
                     self._handle_sourcetable_request(client_socket)
                     continue
 
-                handler = RoverHandler(client_socket, address, self.caster_settings, self.rover_accounts, self.rtcm_data_queue)
+                if self.config['mode'] == 'NtripCaster' and request_str.startswith('SOURCE '):
+                    if self.data_source_worker and self.data_source_worker.is_alive():
+                        print(f"[!] Đã có Base kết nối. Từ chối kết nối Base mới từ {address}")
+                        client_socket.sendall(b"HTTP/1.1 409 Conflict\r\n\r\nERROR - Caster already has a source\r\n")
+                        client_socket.close()
+                    else:
+                        self.data_source_worker = BaseStationHandler(client_socket, address, self.config, self.rtcm_data_queue, self._on_base_disconnect)
+                        self.data_source_worker.start()
+                    continue
+                
+                # <<< THAY ĐỔI: Truyền danh sách tài khoản toàn cục vào RoverHandler
+                handler = RoverHandler(
+                    client_socket, 
+                    address, 
+                    self.caster_settings, 
+                    self.global_rover_accounts, 
+                    self.rtcm_data_queue
+                )
                 handler.start()
                 self.rover_handlers.append(handler)
                 self.rover_handlers = [h for h in self.rover_handlers if h.is_alive()]
@@ -297,35 +365,86 @@ class NtripCasterServer:
     def stop(self):
         print("\n[*] Đang dừng Caster...")
         self.stop_event.set()
-        if self.client_worker and self.client_worker.is_alive():
-            print("...Đang dừng Client Worker...")
-            self.client_worker.stop()
-            self.client_worker.join(timeout=5)
+        
+        if self.data_source_worker and self.data_source_worker.is_alive():
+            print(f"...Đang dừng nguồn dữ liệu ({self.data_source_worker.name})...")
+            self.data_source_worker.stop()
+            self.data_source_worker.join(timeout=5)
+
         if self.server_socket:
             print("...Đang đóng Server Socket...")
             self.server_socket.close()
+            
         for handler in self.rover_handlers:
             if handler.is_alive():
                 handler.join(timeout=2)
-        print("=============================================")
+                
+        print("="*45)
         print("======== NTRIP CASTER ĐÃ DỪNG HẲN ========")
-        print("=============================================")
+        print("="*45)
 
+# ==============================================================================
+# Hàm main (Cập nhật)
+# ==============================================================================
 if __name__ == "__main__":
     if not os.path.exists(CONFIG_FILE):
         print(f"[!] Lỗi: Không tìm thấy file cấu hình '{CONFIG_FILE}'.")
         exit(1)
+    
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             config_data = json.load(f)
+            
+        # <<< THAY ĐỔI: Đọc cả stations và global_rover_accounts
+        stations = config_data.get("stations", [])
+        global_accounts = config_data.get("global_rover_accounts", [])
+        
+        if not stations:
+            print(f"[!] Lỗi: File cấu hình '{CONFIG_FILE}' không có trạm nào được định nghĩa trong 'stations'.")
+            exit(1)
+        if not global_accounts:
+            print(f"[!] Cảnh báo: Không tìm thấy tài khoản rover nào trong 'global_rover_accounts'. Sẽ không có rover nào kết nối được.")
+            
     except json.JSONDecodeError as e:
         print(f"[!] Lỗi: File cấu hình '{CONFIG_FILE}' không đúng định dạng JSON. Lỗi: {e}")
         exit(1)
+    except Exception as e:
+        print(f"[!] Lỗi không xác định khi đọc file cấu hình: {e}")
+        exit(1)
+
+    print("--- VUI LÒNG CHỌN TRẠM CORS ĐỂ KHỞI ĐỘNG ---")
+    for i, station in enumerate(stations):
+        print(f"  {i + 1}. {station.get('name', f'Trạm không tên {i+1}')} (Mode: {station.get('mode', 'Chưa rõ')})")
+    print("  0. Thoát")
+    print("---------------------------------------------")
+
+    choice = -1
+    while True:
+        try:
+            choice_str = input("Nhập lựa chọn của bạn: ")
+            choice = int(choice_str)
+            if 0 <= choice <= len(stations):
+                break
+            else:
+                print("[!] Lựa chọn không hợp lệ. Vui lòng chọn một số từ danh sách trên.")
+        except ValueError:
+            print("[!] Vui lòng nhập một con số.")
+
+    if choice == 0:
+        print("[-] Đã thoát chương trình.")
+        exit(0)
     
-    caster = NtripCasterServer(config_data)
+    selected_station_config = stations[choice - 1]
+    
+    caster = None
     try:
+        # <<< THAY ĐỔI: Truyền danh sách tài khoản toàn cục khi khởi tạo Caster
+        caster = NtripCasterServer(selected_station_config, global_accounts)
         caster.start()
     except KeyboardInterrupt:
         print("\n[!] Nhận tín hiệu Ctrl+C, đang tắt chương trình...")
+    except Exception as e:
+        print(f"\n[!] Một lỗi nghiêm trọng đã xảy ra: {e}")
     finally:
-        caster.stop()
+        if caster:
+            caster.stop()
